@@ -149,6 +149,71 @@ if (isset($_POST['page'])) {
     }
 
     /* =========================
+       USER PROFILE UPDATE
+    ========================== */
+    if ($_POST['page'] == 'profile' && $_POST['action'] == 'profile') {
+        $output = array();
+        
+        // Handle file upload if new image is provided
+        $user_image = $_POST['hidden_user_image'];
+        if (isset($_FILES['user_image']) && $_FILES['user_image']['name'] != '') {
+            // Check file size (2MB limit)
+            if ($_FILES['user_image']['size'] > 2097152) {
+                $output['error'] = 'File size too large. Maximum 2MB allowed.';
+                echo json_encode($output);
+                exit;
+            }
+            
+            $allowed_extensions = array('jpg', 'jpeg', 'png', 'gif');
+            $extension = strtolower(pathinfo($_FILES['user_image']['name'], PATHINFO_EXTENSION));
+            
+            if (!in_array($extension, $allowed_extensions)) {
+                $output['error'] = 'Invalid file type. Only JPG, JPEG, PNG, GIF allowed.';
+                echo json_encode($output);
+                exit;
+            }
+            
+            // Delete old image if it exists and is not default
+            if ($user_image != '' && file_exists('upload/' . $user_image)) {
+                unlink('upload/' . $user_image);
+            }
+            
+            $user_image = uniqid() . '.' . $extension;
+            move_uploaded_file($_FILES['user_image']['tmp_name'], 'upload/' . $user_image);
+        }
+
+        $exam->data = array(
+            ':user_name' => $_POST['user_name'],
+            ':user_gender' => $_POST['user_gender'],
+            ':user_address' => $_POST['user_address'],
+            ':user_mobile_no' => $_POST['user_mobile_no'],
+            ':user_image' => $user_image,
+            ':user_id' => $_SESSION['user_id']
+        );
+
+        $exam->query = "
+        UPDATE user_table 
+        SET user_name = :user_name, 
+            user_gender = :user_gender, 
+            user_address = :user_address, 
+            user_mobile_no = :user_mobile_no, 
+            user_image = :user_image 
+        WHERE user_id = :user_id
+        ";
+
+        if ($exam->execute_query()) {
+            // Update session data
+            $_SESSION['user_name'] = $_POST['user_name'];
+            $output['success'] = true;
+        } else {
+            $output['error'] = 'Failed to update profile. Please try again.';
+        }
+
+        echo json_encode($output);
+        exit;
+    }
+
+    /* =========================
        FETCH EXAM LIST (for DataTable)
     ========================== */
     if ($_POST['page'] == 'enroll_exam' && $_POST['action'] == 'fetch') {
@@ -217,56 +282,11 @@ if (isset($_POST['page'])) {
             $sub_array[] = $row["online_exam_code"];
             $sub_array[] = $row["online_exam_id"];
 
-            // Compute exam active status based on local-day equality (user's local date equals scheduled local date)
-            $is_active = false;
-            $can_take = false;
-
-            $scheduled_datetime = $row["online_exam_datetime"];
-            $user_current_date = null;
-            $scheduled_local_date = null;
-
-            // Prefer tz_name if provided in request
-            if (isset($_POST['tz_name']) && is_string($_POST['tz_name']) && $_POST['tz_name'] !== '') {
-                $tz_name = $_POST['tz_name'];
-                try {
-                    $user_tz = new DateTimeZone($tz_name);
-                    $server_tz = new DateTimeZone(date_default_timezone_get());
-                    $scheduled_dt = new DateTime($scheduled_datetime, $server_tz);
-                    $scheduled_dt->setTimezone($user_tz);
-                    $scheduled_local_date = $scheduled_dt->format('Y-m-d');
-
-                    $user_now = new DateTime('now', $user_tz);
-                    $user_current_date = $user_now->format('Y-m-d');
-                } catch (Exception $e) {
-                    // invalid tz_name; reset to null to use fallback
-                    $user_current_date = null;
-                    $scheduled_local_date = null;
-                }
-            }
-
-            // Fallback to tz_offset if tz_name not available or invalid
-            if ($user_current_date === null) {
-                $tz_offset = isset($_POST['tz_offset']) ? intval($_POST['tz_offset']) : null;
-                if ($tz_offset !== null) {
-                    $user_now_ts = time() - ($tz_offset * 60);
-                    $user_current_date = date('Y-m-d', $user_now_ts);
-                    $scheduled_local_date = date('Y-m-d', strtotime($scheduled_datetime) - ($tz_offset * 60));
-                }
-            }
-
-            // Last resort: server-local date comparison
-            if ($user_current_date === null) {
-                $user_current_date = date('Y-m-d');
-                $scheduled_local_date = date('Y-m-d', strtotime($scheduled_datetime));
-            }
-
-            if ($scheduled_local_date === $user_current_date) {
-                $is_active = true;
-            }
-
-            if ($row["enrollment_status"] == 'Enrolled' && $is_active) {
-                $can_take = true;
-            }
+            // Previously this code compared server/ client local dates to decide if an exam
+            // was active for the current day; scheduling-by-date has been removed so
+            // exams are considered active for enrolled users regardless of date.
+            $is_active = true; // always mark active (schedule date no longer enforced)
+            $can_take = ($row["enrollment_status"] == 'Enrolled');
 
             $sub_array[] = $is_active ? '1' : '0';
             $sub_array[] = $can_take ? '1' : '0';
@@ -288,6 +308,7 @@ if (isset($_POST['page'])) {
        CHECK EXAM SCHEDULE (AJAX helper)
     ========================== */
     if ($_POST['page'] == 'enroll_exam' && isset($_POST['action']) && $_POST['action'] == 'check_schedule') {
+        // Scheduling-by-date removed: always allow taking exam when requested.
         $exam_id = intval($_POST['exam_id']);
         $exam->query = "SELECT online_exam_datetime FROM online_exam_table WHERE online_exam_id = :exam_id LIMIT 1";
         $exam->data = array(':exam_id' => $exam_id);
@@ -297,67 +318,9 @@ if (isset($_POST['page'])) {
             exit;
         }
         $scheduled = $res[0]['online_exam_datetime'];
-
-        // Prefer IANA timezone name if provided
-        if (isset($_POST['tz_name']) && is_string($_POST['tz_name']) && $_POST['tz_name'] !== '') {
-            $tz_name = $_POST['tz_name'];
-            try {
-                $user_tz = new DateTimeZone($tz_name);
-                // Create DateTime from scheduled string using server timezone, then convert to user's timezone
-                $server_tz = new DateTimeZone(date_default_timezone_get());
-                $scheduled_dt = new DateTime($scheduled, $server_tz);
-                $scheduled_dt->setTimezone($user_tz);
-                $scheduled_local_date = $scheduled_dt->format('Y-m-d');
-
-                $user_now = new DateTime('now', $user_tz);
-                $current_date = $user_now->format('Y-m-d');
-
-                $allowed = ($scheduled_local_date === $current_date);
-                // fallback: if server's scheduled date equals server's current date, allow as well
-                if (!$allowed) {
-                    $server_scheduled_date = date('Y-m-d', strtotime($scheduled));
-                    if ($server_scheduled_date === date('Y-m-d')) {
-                        $allowed = true;
-                        $scheduled_local_date = $server_scheduled_date;
-                    }
-                }
-                echo json_encode(['success' => true, 'allowed' => $allowed, 'scheduled_date' => $scheduled_local_date]);
-                exit;
-            } catch (Exception $e) {
-                // invalid timezone, fall through to offset or server comparison
-            }
-        }
-
-        // If client provided tz_offset (minutes from getTimezoneOffset), compute user's local date as fallback
-        $tz_offset = isset($_POST['tz_offset']) ? intval($_POST['tz_offset']) : null;
-        if ($tz_offset !== null) {
-            // JS getTimezoneOffset() returns minutes to add to local time to get UTC
-            // To get user's local timestamp from UTC timestamp: user_local = time() - (tz_offset*60)
-            $user_now_ts = time() - ($tz_offset * 60);
-            $current_date = date('Y-m-d', $user_now_ts);
-
-            // Convert scheduled datetime to timestamp (absolute) and then to user's local date
-            $scheduled_ts = strtotime($scheduled);
-            $scheduled_local_date = date('Y-m-d', $scheduled_ts - ($tz_offset * 60));
-
-            $allowed = ($scheduled_local_date === $current_date);
-            // fallback: allow if server-side scheduled date equals server date
-            if (!$allowed) {
-                $server_scheduled_date = date('Y-m-d', strtotime($scheduled));
-                if ($server_scheduled_date === date('Y-m-d')) {
-                    $allowed = true;
-                    $scheduled_local_date = $server_scheduled_date;
-                }
-            }
-            echo json_encode(['success' => true, 'allowed' => $allowed, 'scheduled_date' => $scheduled_local_date]);
-            exit;
-        }
-
-        // Fallback: use server date comparison
         $scheduled_date = date('Y-m-d', strtotime($scheduled));
-        $current_date = date('Y-m-d');
-        $allowed = ($scheduled_date === $current_date);
-        echo json_encode(['success' => true, 'allowed' => $allowed, 'scheduled_date' => $scheduled_date]);
+        // Always allow; include scheduled_date for UI information only.
+        echo json_encode(['success' => true, 'allowed' => true, 'scheduled_date' => $scheduled_date]);
         exit;
     }
 
@@ -365,9 +328,27 @@ if (isset($_POST['page'])) {
        ENROLL IN EXAM
     ========================== */
     if ($_POST['page'] == 'index' && $_POST['action'] == 'enroll_exam') {
+        $exam_id = intval($_POST['exam_id']);
+        $user_id = $_SESSION['user_id'];
+
+        // Check if user is already enrolled to prevent duplicates
+        $exam->query = "
+        SELECT * FROM user_exam_enroll_table 
+        WHERE user_id = :user_id AND exam_id = :exam_id LIMIT 1
+        ";
+        $exam->data = array(':user_id' => $user_id, ':exam_id' => $exam_id);
+        $existing = $exam->query_result();
+
+        if (!empty($existing)) {
+            // Already enrolled, return success (idempotent)
+            echo json_encode(['success' => true, 'message' => 'Already enrolled']);
+            exit;
+        }
+
+        // Proceed with enrollment
         $exam->data = array(
-            ':user_id' => $_SESSION['user_id'],
-            ':exam_id' => $_POST['exam_id']
+            ':user_id' => $user_id,
+            ':exam_id' => $exam_id
         );
 
         $exam->query = "
@@ -379,25 +360,39 @@ if (isset($_POST['page'])) {
         // Insert default question answers for this user
         $exam->query = "
         SELECT question_id FROM question_table 
-        WHERE online_exam_id = '" . $_POST['exam_id'] . "'
+        WHERE online_exam_id = '" . $exam_id . "'
         ";
         $result = $exam->query_result();
 
         foreach ($result as $row) {
-            $exam->data = array(
-                ':user_id' => $_SESSION['user_id'],
-                ':exam_id' => $_POST['exam_id'],
-                ':question_id' => $row['question_id'],
-                ':user_answer_option' => '0',
-                ':marks' => '0'
-            );
-
+            // Check if answer already exists before inserting
             $exam->query = "
-            INSERT INTO user_exam_question_answer 
-            (user_id, exam_id, question_id, user_answer_option, marks) 
-            VALUES (:user_id, :exam_id, :question_id, :user_answer_option, :marks)
+            SELECT * FROM user_exam_question_answer 
+            WHERE user_id = :user_id AND exam_id = :exam_id AND question_id = :question_id LIMIT 1
             ";
-            $exam->execute_query();
+            $exam->data = array(
+                ':user_id' => $user_id,
+                ':exam_id' => $exam_id,
+                ':question_id' => $row['question_id']
+            );
+            $answer_exists = $exam->query_result();
+
+            if (empty($answer_exists)) {
+                $exam->data = array(
+                    ':user_id' => $user_id,
+                    ':exam_id' => $exam_id,
+                    ':question_id' => $row['question_id'],
+                    ':user_answer_option' => '0',
+                    ':marks' => '0'
+                );
+
+                $exam->query = "
+                INSERT INTO user_exam_question_answer 
+                (user_id, exam_id, question_id, user_answer_option, marks) 
+                VALUES (:user_id, :exam_id, :question_id, :user_answer_option, :marks)
+                ";
+                $exam->execute_query();
+            }
         }
 
         echo json_encode(['success' => true]);
